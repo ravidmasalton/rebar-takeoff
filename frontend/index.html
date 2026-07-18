@@ -168,6 +168,10 @@
       );
     }
 
+    // Only quantity-affecting flags belong in the warning panel; shape
+    // resolution is cosmetic and would flood it on busy drawings.
+    const WARN_FLAGS = ["estimated_width", "unresolved_width", "missing_length"];
+
     function Summary({ items }) {
       // Derive the summary live from the (possibly edited) rows. Rows with no
       // resolvable count (count <= 0) are shown but excluded from the totals.
@@ -182,7 +186,8 @@
           excluded += 1;
         }
         srcCount[it.source] = (srcCount[it.source] || 0) + 1;
-        if (it.flags && it.flags.length) flagged.push(it);
+        const warn = (it.flags || []).filter((f) => WARN_FLAGS.includes(f));
+        if (warn.length) flagged.push({ id: it.id, flags: warn });
       }
       const rows = Object.values(per).sort((a, b) => a.diameter - b.diameter);
 
@@ -262,7 +267,7 @@
             <input className="cell" type="number" value={item.count}
                    onChange={(e) => editCount(e.target.value)} />
           </td>
-          <td>{item.shape ?? "…"}</td>
+          <td>{item.shape == null ? "…" : item.shape === "needs review" ? "—" : item.shape}</td>
           <td>{item.total_m.toFixed(2)}</td>
           <td><strong>{item.weight_kg.toFixed(2)}</strong></td>
           <td><span className={"tag " + item.source}>{
@@ -324,9 +329,7 @@
               return prev.map((it) => {
                 const s = j.shapes[it.id];
                 if (!s) return it;
-                const flags = s.shape === "needs review" && !(it.flags || []).includes("unresolved_shape")
-                  ? [...(it.flags || []), "unresolved_shape"] : it.flags;
-                return { ...it, shape: s.shape, shape_segments_pts: s.segments_pts, flags };
+                return { ...it, shape: s.shape, shape_segments_pts: s.segments_pts };
               });
             });
           })

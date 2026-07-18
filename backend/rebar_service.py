@@ -56,14 +56,25 @@ STEEL_KG_PER_M_COEFF = 0.006165
 # is a signal that a bidi-reversed token was read in the wrong direction.
 VALID_DIAMETERS = {8, 10, 12, 14, 16, 20, 25}
 
+# Flags that warrant a manual-verification warning in the summary. Quantity
+# flags only: shape resolution has no bearing on the totals, and listing it
+# floods the panel on drawings with hard-to-chain linework.
+SUMMARY_WARN_FLAGS = ("estimated_width", "unresolved_width", "missing_length")
+
 # --- Geometry / heuristic thresholds ---------------------------------------
 
 # A distributed callout's zone width must be at least this many cm to be a
 # plausible distribution span (filters out stray small dimension numbers).
 MIN_ZONE_WIDTH_CM = 60.0
 
-# Max distance (in PDF points) to associate an L= token with a callout.
+# Max gap (in PDF points, along the reading direction) between a callout and
+# its L= token. ``nöd@s L=len`` is one printed phrase, so the two tokens sit
+# on the same printed line a bounded gap apart.
 LENGTH_MATCH_RADIUS = 160.0
+
+# Perpendicular offset tolerance for "same printed line", as a fraction of
+# the larger of the two glyph heights.
+LINE_PERP_TOL = 0.8
 
 # Max distance (in PDF points) to associate a standalone width number with a
 # distributed callout.
@@ -427,6 +438,31 @@ def _connected_components(segs: list[Segment]) -> list[list[Segment]]:
     return list(groups.values())
 
 
+def _bold_threshold(widths: list[float]) -> float:
+    """
+    Lower bound of the "bold" (bar) stroke-width class.
+
+    Drawings use two stroke classes near a callout: thin annotation (grid,
+    leaders, dimension lines) and bold rebar. Splitting them at the largest
+    *relative* gap between adjacent distinct widths adapts to whatever
+    widths a given drawing uses — unlike a median cut (thin linework
+    outnumbers the bar, so the median lands in the thin class and lets every
+    stray line pollute the component) or a fraction-of-max cut (a thicker
+    neighbouring bar inside the search radius pushes the cut above this
+    callout's own bar). When no clearly separated class exists (ratio <
+    1.5), everything is a candidate and chaining decides.
+    """
+    uniq = sorted(set(widths))
+    if len(uniq) == 1:
+        return uniq[0]
+    best_ratio, best_split = 0.0, uniq[0]
+    for a, b in zip(uniq, uniq[1:]):
+        ratio = b / max(a, 1e-6)
+        if ratio > best_ratio:
+            best_ratio, best_split = ratio, b
+    return best_split if best_ratio >= 1.5 else uniq[0]
+
+
 def _detect_shape(
     tok: Token, segments: list[Segment]
 ) -> tuple[str, list[float], Optional[list[Segment]]]:
@@ -443,9 +479,10 @@ def _detect_shape(
     if not near:
         return "needs review", [], None
 
-    # Rebar is drawn bold: keep only the thicker strokes in the neighbourhood.
-    widths = sorted(s.linewidth for s in near)
-    thresh = widths[len(widths) // 2]  # median
+    # Rebar is drawn bold: drop the thin annotation class, keep every bar-
+    # class stroke (see _bold_threshold), then let proximity pick the right
+    # bar among the surviving components.
+    thresh = _bold_threshold([s.linewidth for s in near])
     bold = [s for s in near if s.linewidth >= thresh and s.length > 1.0]
     if not bold:
         return "needs review", [], None
@@ -499,27 +536,67 @@ def _parse_callouts(tokens: list[Token]) -> list[_Callout]:
     return callouts
 
 
-def _find_length(
-    callout: _Callout, tokens: list[Token]
-) -> tuple[Optional[float], Optional[Token]]:
-    """Return (length_cm, token). The token is None for inline lengths."""
-    if callout.inline_length is not None:
-        return callout.inline_length, None
-    best: Optional[float] = None
-    best_tok: Optional[Token] = None
-    best_dist = LENGTH_MATCH_RADIUS
-    for tok in tokens:
-        if tok.page != callout.tok.page:
+def _token_orientation(tok: Token) -> str:
+    """'h' for horizontally-set text, 'v' for vertical (rotated) text."""
+    return "h" if (tok.x1 - tok.x0) >= (tok.bottom - tok.top) else "v"
+
+
+def _interval_gap(a0: float, a1: float, b0: float, b1: float) -> float:
+    """Distance between intervals [a0,a1] and [b0,b1]; 0 when they overlap."""
+    return max(0.0, max(a0, b0) - min(a1, b1))
+
+
+def _pair_lengths(
+    callouts: list[_Callout], tokens: list[Token]
+) -> dict[int, tuple[float, Token]]:
+    """
+    Globally assign L= tokens to the callouts of one page.
+
+    ``nöd@s L=len`` is one printed phrase: a callout's L= token shares its
+    text orientation and sits on the same printed line (small perpendicular
+    offset), a bounded gap away along the reading direction. Naive
+    per-callout nearest-distance matching steals a neighbouring callout's
+    L= whenever a callout has none of its own — so instead every valid
+    (callout, L=) pair is scored by collinearity (perpendicular offset
+    dominates, then gap) and assigned greedily best-first, each L= token
+    consumed by exactly one callout. A callout with no valid candidate gets
+    no length: a wrong token is never taken silently.
+
+    Returns {callout_index: (length_cm, token)}.
+    """
+    length_toks = [t for t in tokens if LENGTH_RE.match(t.text)]
+    candidates: list[tuple[float, int, int]] = []
+    for ci, c in enumerate(callouts):
+        if c.inline_length is not None:
             continue
-        m = LENGTH_RE.match(tok.text)
-        if not m:
+        ori = _token_orientation(c.tok)
+        for ti, t in enumerate(length_toks):
+            if _token_orientation(t) != ori:
+                continue
+            if ori == "h":
+                perp = abs(t.cy - c.tok.cy)
+                perp_tol = LINE_PERP_TOL * max(c.tok.bottom - c.tok.top,
+                                               t.bottom - t.top)
+                gap = _interval_gap(c.tok.x0, c.tok.x1, t.x0, t.x1)
+            else:
+                perp = abs(t.cx - c.tok.cx)
+                perp_tol = LINE_PERP_TOL * max(c.tok.x1 - c.tok.x0,
+                                               t.x1 - t.x0)
+                gap = _interval_gap(c.tok.top, c.tok.bottom, t.top, t.bottom)
+            if perp > perp_tol or gap > LENGTH_MATCH_RADIUS:
+                continue
+            candidates.append((perp * 3.0 + gap, ci, ti))
+
+    candidates.sort(key=lambda x: x[0])
+    assigned: dict[int, tuple[float, Token]] = {}
+    taken: set[int] = set()
+    for _score, ci, ti in candidates:
+        if ci in assigned or ti in taken:
             continue
-        d = math.hypot(tok.cx - callout.tok.cx, tok.cy - callout.tok.cy)
-        if d <= best_dist:
-            best_dist = d
-            best = float(m.group("len"))
-            best_tok = tok
-    return best, best_tok
+        tok = length_toks[ti]
+        assigned[ci] = (float(LENGTH_RE.match(tok.text).group("len")), tok)
+        taken.add(ti)
+    return assigned
 
 
 def _find_zone_width(
@@ -527,11 +604,18 @@ def _find_zone_width(
     number_tokens: list[Token],
     used: set[int],
 ) -> Optional[tuple[float, int]]:
-    """Nearest unused standalone width number >= MIN_ZONE_WIDTH_CM."""
+    """
+    Nearest unused standalone width number >= MIN_ZONE_WIDTH_CM that shares
+    the callout's text orientation (a zone's dimension number is printed
+    parallel to its callout, like the rest of the annotation).
+    """
     best_idx = None
     best_dist = WIDTH_MATCH_RADIUS
+    ori = _token_orientation(callout.tok)
     for idx, tok in enumerate(number_tokens):
         if idx in used or tok.page != callout.tok.page:
+            continue
+        if _token_orientation(tok) != ori:
             continue
         value = float(tok.text)
         if value < MIN_ZONE_WIDTH_CM:
@@ -858,6 +942,7 @@ def _parse_rows(
 
             report("detect", page_base + page_share * 0.7)
             callouts = _parse_callouts(tokens)
+            length_pairs = _pair_lengths(callouts, tokens)
 
             # Standalone width-candidate numbers: pure numbers that are not
             # part of a callout/length token and are not circled element marks.
@@ -868,8 +953,11 @@ def _parse_rows(
             ]
             used_widths: set[int] = set()
 
-            for callout in callouts:
-                length_cm, length_tok = _find_length(callout, tokens)
+            for ci, callout in enumerate(callouts):
+                if callout.inline_length is not None:
+                    length_cm, length_tok = callout.inline_length, None
+                else:
+                    length_cm, length_tok = length_pairs.get(ci, (None, None))
                 flags: list[str] = []
                 width_tok: Optional[Token] = None
                 zone_width: Optional[float] = None
@@ -985,8 +1073,9 @@ def _build_response(items: list[Item]) -> dict:
 
         source_counts[it.source] = source_counts.get(it.source, 0) + 1
 
-        if it.flags:
-            flagged.append({"id": it.id, "flags": it.flags, "shape": it.shape})
+        warn = [f for f in it.flags if f in SUMMARY_WARN_FLAGS]
+        if warn:
+            flagged.append({"id": it.id, "flags": warn})
 
     per_diameter = [
         {

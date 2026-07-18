@@ -167,6 +167,106 @@ def test_shapes_are_lazy_and_classified():
     assert analysis.shapes() is shapes  # cached, computed once
 
 
+def test_length_not_stolen_by_neighbor():
+    """A callout with no L= of its own must not grab a neighbouring row's."""
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    c.setFont("Helvetica", 10)
+    c.drawString(100, 700, "5ö16")
+    c.drawString(150, 700, "L=650")   # same printed line as 5ö16
+    c.drawString(100, 720, "3ö12")    # 20pt above; its nearest L= is the one above
+    c.showPage()
+    c.save()
+
+    items = rebar_service.analyze_pdf(buf.getvalue())["items"]
+    by_dia = {it["diameter"]: it for it in items}
+    assert by_dia[16]["length_cm"] == 650.0
+    assert by_dia[12]["length_cm"] is None
+    assert "missing_length" in by_dia[12]["flags"]
+
+
+def _tok(text, x0, top, x1, bottom):
+    return rebar_service.Token(
+        text=text, raw=text, x0=x0, x1=x1, top=top, bottom=bottom, page=1
+    )
+
+
+def _callout_of(tok):
+    m = rebar_service.CALLOUT_RE.match(tok.text)
+    return rebar_service._Callout(
+        tok=tok,
+        n=int(m.group("n")) if m.group("n") else None,
+        diameter=int(m.group("dia")),
+        spacing=int(m.group("sp")) if m.group("sp") else None,
+        inline_length=None,
+    )
+
+
+def test_pair_lengths_requires_matching_orientation():
+    # Vertical callout (box taller than wide) with a collinear vertical L=
+    # below it, plus a closer horizontal L= that must be ignored.
+    vert_callout = _callout_of(_tok("ö10@20", 100, 600, 110, 640))
+    vert_len = _tok("L=650", 100, 645, 110, 680)
+    horiz_len = _tok("L=999", 115, 610, 150, 620)
+
+    pairs = rebar_service._pair_lengths(
+        [vert_callout], [vert_len, horiz_len]
+    )
+    assert pairs == {0: (650.0, vert_len)}
+
+
+def test_shape_detection_survives_thin_linework_and_width_variation():
+    """
+    The two regressions seen on real drawings: (a) thin leader/dimension
+    lines joining the bar's component, (b) a thicker neighbouring bar
+    pushing a fraction-of-max cut above this callout's own thinner bar.
+    """
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    c.setFont("Helvetica", 10)
+
+    # Callout A with a 1.6pt U-bar, thin leader touching the bar.
+    c.drawString(120, 720, "ö10@20")
+    c.drawString(190, 720, "L=100")
+    c.setLineWidth(0.4)
+    c.line(140, 718, 160, 682)            # leader down to the bar
+    c.setLineWidth(1.6)
+    p = c.beginPath()
+    p.moveTo(100, 735); p.lineTo(100, 680); p.lineTo(230, 680); p.lineTo(230, 735)
+    c.drawPath(p)
+
+    # Callout B nearby with a much bolder 3.0pt straight bar.
+    c.drawString(320, 520, "5ö16")
+    c.drawString(370, 520, "L=650")
+    c.setLineWidth(3.0)
+    c.line(300, 490, 460, 490)
+    c.showPage()
+    c.save()
+
+    analysis = rebar_service.Analysis(buf.getvalue())
+    items = analysis.response()["items"]
+    shapes = analysis.shapes()
+    by_dia = {it["diameter"]: shapes[it["id"]]["shape"] for it in items}
+    assert by_dia[10] == "U"
+    assert by_dia[16] == "straight"
+
+
+def test_summary_flags_only_quantity_warnings():
+    """estimated_count must not reach the flagged panel; warn flags must."""
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    c.setFont("Helvetica", 10)
+    c.drawString(100, 700, "ö16")     # no count, no spacing -> estimated_count
+    c.drawString(140, 700, "L=650")
+    c.showPage()
+    c.save()
+
+    result = rebar_service.analyze_pdf(buf.getvalue())
+    item = result["items"][0]
+    assert "estimated_count" in item["flags"]        # still on the row
+    assert result["summary"]["flagged_items"] == []  # but not in the panel
+
+
 def test_progress_callback_phases():
     events = []
     rebar_service.Analysis(_make_pdf(shift=False), progress=lambda p, pct: events.append((p, pct)))

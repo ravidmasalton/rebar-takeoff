@@ -28,11 +28,20 @@ All logic lives in [backend/rebar_service.py](backend/rebar_service.py).
   reverse parse as a callout (`41ö2` ↔ `2ö14`), the orientation with a real bar
   size wins. Tokens that are invalid both ways are dropped — never a Ø2/Ø3 row.
 
+**L= pairing**: `nöd@s L=len` is one printed phrase, so an L= token must share
+its callout's text orientation and sit on the same printed line (perpendicular
+offset within 0.8× glyph height, gap ≤ 160 pt along the reading direction).
+Assignment is **global per page**: candidate (callout, L=) pairs are scored by
+collinearity and matched greedily best-first, each L= consumed by exactly one
+callout — per-callout nearest-distance matching stole a neighbouring row's L=
+whenever a callout had none of its own. No valid candidate → `missing_length`,
+never a silently wrong token.
+
 **Counts**
 - *Explicit* (`5ö16 L=650`): count = `n`, source `explicit`.
 - *Distributed* (`ö10@20 L=100`): paired with the nearest standalone width number
-  (≥ 60 cm, not a circled element mark, each used once); count = `ceil(width/spacing)+1`,
-  source `measured_width`.
+  (≥ 60 cm, not a circled element mark, sharing the callout's text orientation,
+  each used once); count = `ceil(width/spacing)+1`, source `measured_width`.
 - *Distributed with no width*: width is **estimated** from the median measured
   width of the same `(dia, spacing, length)` group, else the same `(dia, spacing)`
   group (source `estimated`, flagged `estimated_width`). If no peer measurements
@@ -44,7 +53,16 @@ aggregated per diameter + grand total.
 
 **Shape**: bold vector polyline nearest the callout is chained and classified
 `straight / L / U / Z` (U vs Z by bend direction). Ambiguous → `needs review`,
-never guessed. Profiling showed this pass (O(n²) connected-components over the
+never guessed (the UI shows it as `—`). Bar strokes are separated from thin
+annotation (grid/leader/dimension lines) by splitting the neighbourhood's
+stroke widths at the largest *relative* gap between distinct widths — a median
+cut lets thin linework pollute the component, and a fraction-of-max cut loses
+the callout's own bar when a thicker neighbouring bar is inside the search
+radius. On a ground-truth sheet (40 callouts, mixed shapes, bars at 1.6/2.2/3.0 pt,
+dense 0.4 pt noise) the old detector classified 10/40 correctly, the current
+one 40/40. Shape flags are cosmetic and **excluded from the summary's flagged
+list** — only quantity flags (`estimated_width`, `unresolved_width`,
+`missing_length`) warrant the manual-verification panel. Profiling showed this pass (O(n²) connected-components over the
 linework near every callout) dominates a naive analyze (~60% of wall time)
 while contributing nothing to counts/weights, so it is **not** part of
 `/analyze`: `GET /shapes?analysis_id=…` computes it lazily from the cached
