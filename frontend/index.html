@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>אמידת כמויות ברזל זיון</title>
+  <!-- React + Babel from CDN: no build step for this small stateless SPA. -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    :root {
+      --bg: #f5f6f8; --card: #ffffff; --line: #e2e5ea; --ink: #1c2430;
+      --muted: #6b7480; --accent: #2563eb; --flag: #b45309; --flagbg: #fef3c7;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--bg); color: var(--ink);
+      font-family: "Segoe UI", Arial, sans-serif; direction: rtl;
+    }
+    .wrap { max-width: 1180px; margin: 0 auto; padding: 24px 20px 60px; }
+    h1 { font-size: 22px; margin: 0 0 4px; }
+    .sub { color: var(--muted); margin: 0 0 20px; font-size: 14px; }
+    .card {
+      background: var(--card); border: 1px solid var(--line);
+      border-radius: 12px; padding: 18px; margin-bottom: 18px;
+    }
+    .drop {
+      border: 2px dashed #b8c0cc; border-radius: 12px; padding: 40px 20px;
+      text-align: center; color: var(--muted); cursor: pointer;
+      transition: .15s; background: #fbfcfd;
+    }
+    .drop.over { border-color: var(--accent); background: #eef4ff; color: var(--accent); }
+    .drop strong { color: var(--ink); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: right; }
+    th { color: var(--muted); font-weight: 600; background: #fafbfc; position: sticky; top: 0; }
+    tr.flagged td { background: var(--flagbg); }
+    input.cell {
+      width: 70px; padding: 4px 6px; border: 1px solid var(--line);
+      border-radius: 6px; font-size: 13px; text-align: right; font-family: inherit;
+    }
+    .tag { display: inline-block; font-size: 11px; padding: 1px 8px; border-radius: 999px; }
+    .tag.explicit { background: #dcfce7; color: #166534; }
+    .tag.measured_width { background: #dbeafe; color: #1e40af; }
+    .tag.estimated { background: var(--flagbg); color: var(--flag); }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+    .stat { background: #f8fafc; border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+    .stat .k { font-size: 12px; color: var(--muted); }
+    .stat .v { font-size: 20px; font-weight: 700; margin-top: 2px; }
+    .grand { background: #eef4ff; border-color: #c7d7fb; }
+    .grand .v { color: var(--accent); }
+    .flags li { color: var(--flag); font-size: 13px; margin: 2px 0; }
+    .err { color: #b91c1c; background: #fee2e2; border: 1px solid #fca5a5;
+           padding: 10px 14px; border-radius: 8px; font-size: 14px; }
+    .muted { color: var(--muted); }
+    .spinner { display: inline-block; width: 18px; height: 18px; border: 2px solid #c7d2fe;
+               border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    button.reset { background: none; border: 1px solid var(--line); border-radius: 8px;
+                   padding: 6px 14px; cursor: pointer; font-family: inherit; font-size: 13px; }
+    tr.excluded td { opacity: .6; }
+    img.thumb { height: 46px; width: 90px; object-fit: contain; border: 1px solid var(--line);
+                border-radius: 6px; cursor: zoom-in; background: #fff; display: block; }
+    .thumb-empty { font-size: 11px; color: var(--muted); }
+    .modal-bg { position: fixed; inset: 0; background: rgba(15,23,42,.7);
+                display: flex; align-items: center; justify-content: center; z-index: 50; padding: 24px; }
+    .modal { background: #fff; border-radius: 12px; padding: 16px; max-width: 92vw; max-height: 92vh;
+             overflow: auto; box-shadow: 0 20px 60px rgba(0,0,0,.4); }
+    .modal img { max-width: 100%; max-height: 74vh; display: block; margin: 0 auto; }
+    .modal .legend { display: flex; gap: 16px; flex-wrap: wrap; margin-top: 12px; font-size: 13px; }
+    .legend .dot { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-inline-end: 6px; vertical-align: middle; }
+    .modal-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+    .modal-head button { border: none; background: #eef1f5; border-radius: 8px; padding: 6px 12px; cursor: pointer; font-family: inherit; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useCallback, useMemo } = React;
+
+    // Weight per metre for a round bar; d in mm. Mirrors the backend formula so
+    // edits recalculate live without a round-trip.
+    const KG_PER_M = (d) => 0.006165 * d * d;
+
+    // Recompute a single row after the user edits its width or count.
+    function recompute(item) {
+      const kgm = KG_PER_M(item.diameter);
+      const totalM = item.length_cm ? (item.count * item.length_cm) / 100 : 0;
+      return { ...item, total_m: +totalM.toFixed(3), weight_kg: +(totalM * kgm).toFixed(3) };
+    }
+
+    function Uploader({ onResult, onError, busy, setBusy }) {
+      const [over, setOver] = useState(false);
+
+      const send = useCallback(async (file) => {
+        if (!file) return;
+        if (!file.name.toLowerCase().endsWith(".pdf")) {
+          onError("יש להעלות קובץ PDF בלבד."); return;
+        }
+        setBusy(true); onError(null);
+        try {
+          const fd = new FormData();
+          fd.append("file", file);
+          const res = await fetch("/analyze", { method: "POST", body: fd });
+          if (!res.ok) {
+            const j = await res.json().catch(() => ({}));
+            throw new Error(j.detail || `שגיאת שרת (${res.status})`);
+          }
+          onResult(await res.json());
+        } catch (e) {
+          onError(e.message || "העלאה נכשלה.");
+        } finally {
+          setBusy(false);
+        }
+      }, [onResult, onError, setBusy]);
+
+      return (
+        <div
+          className={"drop" + (over ? " over" : "")}
+          onDragOver={(e) => { e.preventDefault(); setOver(true); }}
+          onDragLeave={() => setOver(false)}
+          onDrop={(e) => { e.preventDefault(); setOver(false); send(e.dataTransfer.files[0]); }}
+          onClick={() => document.getElementById("file-input").click()}
+        >
+          {busy
+            ? <span><span className="spinner"></span> &nbsp;מנתח את הקובץ…</span>
+            : <span><strong>גררו לכאן קובץ PDF</strong> או לחצו לבחירה</span>}
+          <input id="file-input" type="file" accept="application/pdf" style={{ display: "none" }}
+                 onChange={(e) => send(e.target.files[0])} />
+        </div>
+      );
+    }
+
+    function Summary({ items }) {
+      // Derive the summary live from the (possibly edited) rows. Rows with no
+      // resolvable count (count <= 0) are shown but excluded from the totals.
+      const per = {}, srcCount = {}; let grand = 0; const flagged = []; let excluded = 0;
+      for (const it of items) {
+        const counted = (Number(it.count) || 0) > 0;
+        if (counted) {
+          const d = per[it.diameter] || (per[it.diameter] = { diameter: it.diameter, bars: 0, meters: 0, kg: 0 });
+          d.bars += Number(it.count) || 0; d.meters += it.total_m; d.kg += it.weight_kg;
+          grand += it.weight_kg;
+        } else {
+          excluded += 1;
+        }
+        srcCount[it.source] = (srcCount[it.source] || 0) + 1;
+        if (it.flags && it.flags.length) flagged.push(it);
+      }
+      const rows = Object.values(per).sort((a, b) => a.diameter - b.diameter);
+
+      return (
+        <div className="card">
+          <h1 style={{ fontSize: 16, marginBottom: 12 }}>סיכום</h1>
+          <div className="grid">
+            {rows.map((r) => (
+              <div className="stat" key={r.diameter}>
+                <div className="k">קוטר Ø{r.diameter} — {r.bars} מוטות</div>
+                <div className="v">{r.kg.toFixed(1)} ק"ג</div>
+                <div className="muted" style={{ fontSize: 12 }}>{r.meters.toFixed(1)} מ'</div>
+              </div>
+            ))}
+            <div className="stat grand">
+              <div className="k">סה"כ משקל</div>
+              <div className="v">{grand.toFixed(1)} ק"ג</div>
+            </div>
+          </div>
+          <div style={{ marginTop: 12, fontSize: 13 }} className="muted">
+            מקורות: מפורש {srcCount.explicit || 0} · נמדד {srcCount.measured_width || 0} · הערכה {srcCount.estimated || 0}
+            {excluded > 0 && <span> · {excluded} שורות לא נכללו בסיכום (חסר רוחב)</span>}
+          </div>
+          {flagged.length > 0 && (
+            <ul className="flags" style={{ marginTop: 10 }}>
+              {flagged.map((f) => (
+                <li key={f.id}>⚠ שורה #{f.id}: {f.flags.join(", ")} — נדרשת בדיקה ידנית מול התוכנית</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      );
+    }
+
+    function Row({ item, onChange, onZoom }) {
+      const flagged = item.flags && item.flags.length > 0;
+      const excluded = (Number(item.count) || 0) <= 0;
+
+      // Editing the width re-derives the distributed bar count = ceil(w/spacing)+1.
+      const editWidth = (v) => {
+        const w = v === "" ? null : Number(v);
+        let count = item.count;
+        if (w && item.spacing) count = Math.ceil(w / item.spacing) + 1;
+        onChange(recompute({ ...item, zone_width_cm: w, count }));
+      };
+      const editCount = (v) => {
+        const c = v === "" ? 0 : Number(v);
+        onChange(recompute({ ...item, count: c }));
+      };
+
+      return (
+        <tr className={(flagged ? "flagged " : "") + (excluded ? "excluded" : "")}>
+          <td>{item.id}</td>
+          <td>
+            {item.evidence_png
+              ? <img className="thumb" src={item.evidence_png} alt={"קריאה " + item.id}
+                     onClick={() => onZoom(item)} title="לחצו להגדלה ואימות" />
+              : <span className="thumb-empty">—</span>}
+          </td>
+          <td>Ø{item.diameter}</td>
+          <td>{item.spacing ? "@" + item.spacing : "—"}</td>
+          <td>{item.length_cm ?? "—"}</td>
+          <td>
+            <input className="cell" type="number" value={item.zone_width_cm ?? ""}
+                   placeholder="—" onChange={(e) => editWidth(e.target.value)} />
+          </td>
+          <td>
+            <input className="cell" type="number" value={item.count}
+                   onChange={(e) => editCount(e.target.value)} />
+          </td>
+          <td>{item.shape}</td>
+          <td>{item.total_m.toFixed(2)}</td>
+          <td><strong>{item.weight_kg.toFixed(2)}</strong></td>
+          <td><span className={"tag " + item.source}>{
+            { explicit: "מפורש", measured_width: "נמדד", estimated: "הערכה" }[item.source]
+          }</span></td>
+        </tr>
+      );
+    }
+
+    // Full-size evidence crop with a colour legend for the baked-in overlay.
+    function EvidenceModal({ item, onClose }) {
+      if (!item) return null;
+      return (
+        <div className="modal-bg" onClick={onClose}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-head">
+              <strong>אימות קריאה #{item.id} — Ø{item.diameter}
+                {item.spacing ? " @" + item.spacing : ""}
+                {item.zone_width_cm != null && item.spacing
+                  ? `  →  כמות = ⌈${item.zone_width_cm}/${item.spacing}⌉+1 = ${item.count}`
+                  : ""}</strong>
+              <button onClick={onClose}>סגירה ✕</button>
+            </div>
+            <img src={item.evidence_png} alt={"קריאה " + item.id} />
+            <div className="legend">
+              <span><span className="dot" style={{ background: "#dc1e1e" }}></span>קריאה</span>
+              <span><span className="dot" style={{ background: "#005ae6" }}></span>מספר רוחב אזור</span>
+              <span><span className="dot" style={{ background: "#e68c00" }}></span>אורך L</span>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function App() {
+      const [items, setItems] = useState(null);
+      const [error, setError] = useState(null);
+      const [busy, setBusy] = useState(false);
+      const [zoom, setZoom] = useState(null);   // item whose crop is shown enlarged
+
+      const onResult = (data) => setItems(data.items.map((it) => ({ ...it })));
+      const updateRow = (updated) =>
+        setItems((prev) => prev.map((it) => (it.id === updated.id ? updated : it)));
+
+      return (
+        <div className="wrap">
+          <h1>אמידת כמויות ברזל זיון</h1>
+          <p className="sub">העלאת תוכנית קונסטרוקציה (PDF וקטורי) — חישוב כמויות, אורכים ומשקלים לפי קוטר.</p>
+
+          <div className="card">
+            <Uploader onResult={onResult} onError={setError} busy={busy} setBusy={setBusy} />
+            {error && <div className="err" style={{ marginTop: 12 }}>{error}</div>}
+          </div>
+
+          {items && (
+            <>
+              <Summary items={items} />
+              <div className="card">
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                  <h1 style={{ fontSize: 16, margin: 0 }}>פירוט קריאות ({items.length})</h1>
+                  <button className="reset" onClick={() => { setItems(null); setError(null); }}>ניקוי</button>
+                </div>
+                <div style={{ overflowX: "auto" }}>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>#</th><th>אימות</th><th>קוטר</th><th>מרווח</th><th>אורך (ס"מ)</th>
+                        <th>רוחב אזור (ס"מ)</th><th>כמות</th><th>צורה</th>
+                        <th>סה"כ מ'</th><th>משקל ק"ג</th><th>מקור</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {items.map((it) => <Row key={it.id} item={it} onChange={updateRow} onZoom={setZoom} />)}
+                    </tbody>
+                  </table>
+                </div>
+                {items.length === 0 && <p className="muted">לא זוהו קריאות ברזל בקובץ.</p>}
+              </div>
+            </>
+          )}
+          <EvidenceModal item={zoom} onClose={() => setZoom(null)} />
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
