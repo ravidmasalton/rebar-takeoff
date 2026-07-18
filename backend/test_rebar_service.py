@@ -8,7 +8,6 @@ crops. These tests build such a PDF and assert the crop contains the actual
 drawing ink inside the overlay boxes.
 """
 
-import base64
 import io
 
 import pypdf
@@ -53,10 +52,10 @@ def _make_pdf(shift: bool) -> bytes:
     return out.getvalue()
 
 
-def _decode_crop(item: dict) -> Image.Image:
-    assert item["evidence_png"], "expected an evidence crop"
-    b64 = item["evidence_png"].split(",", 1)[1]
-    return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+def _decode_crop(analysis: rebar_service.Analysis, item_id: int) -> Image.Image:
+    png = analysis.render_evidence(item_id)
+    assert png, "expected an evidence crop"
+    return Image.open(io.BytesIO(png)).convert("RGB")
 
 
 def _red_box(img: Image.Image) -> tuple:
@@ -87,7 +86,8 @@ def _has_dark_ink_inside(img: Image.Image, box: tuple) -> bool:
 
 @pytest.mark.parametrize("shift", [False, True], ids=["origin_0_0", "shifted_mediabox"])
 def test_evidence_crop_alignment(shift):
-    result = rebar_service.analyze_pdf(_make_pdf(shift))
+    analysis = rebar_service.Analysis(_make_pdf(shift))
+    result = analysis.response()
     assert len(result["items"]) == 1
     item = result["items"][0]
 
@@ -98,7 +98,10 @@ def test_evidence_crop_alignment(shift):
     assert item["count"] == 16
     assert item["source"] == "measured_width"
 
-    crop = _decode_crop(item)
+    # Images are rendered on demand, never inlined in the analyze response.
+    assert "evidence_png" not in item
+
+    crop = _decode_crop(analysis, item["id"])
 
     # Not blank: the raw drawing must contribute real ink.
     hist = crop.convert("L").histogram()
@@ -120,11 +123,10 @@ def test_blank_crop_is_rejected_not_returned():
     c.showPage()
     c.save()
 
-    result = rebar_service.analyze_pdf(buf.getvalue())
-    item = result["items"][0]
+    analysis = rebar_service.Analysis(buf.getvalue())
+    item = analysis.response()["items"][0]
     # This page has real content at the callout, so the crop must exist...
-    assert item["evidence_png"] is not None
-    crop = _decode_crop(item)
+    crop = _decode_crop(analysis, item["id"])
     # ...and be genuinely non-blank.
     hist = crop.convert("L").histogram()
     assert sum(hist[:245]) / sum(hist) > rebar_service.CROP_MIN_INK_FRACTION
@@ -132,12 +134,22 @@ def test_blank_crop_is_rejected_not_returned():
 
 def test_crop_is_tight_not_full_page():
     """The crop should cover just the evidence tokens + margin, not 200pt radius."""
-    result = rebar_service.analyze_pdf(_make_pdf(shift=False))
-    crop = _decode_crop(result["items"][0])
-    # Evidence spans ~160pt wide (tokens 100..260) + 2*40pt margin = ~240pt.
-    # At 300 DPI that is ~1000px, capped at CROP_MAX_PX after downscale.
+    analysis = rebar_service.Analysis(_make_pdf(shift=False))
+    item = analysis.response()["items"][0]
+    crop = _decode_crop(analysis, item["id"])
+    # Evidence spans ~160pt wide (tokens 100..260) + 2*40pt margin = ~240pt,
+    # rendered at RENDER_DPI and capped at CROP_MAX_PX after downscale.
     assert crop.width <= rebar_service.CROP_MAX_PX
     assert crop.height <= rebar_service.CROP_MAX_PX
+    # Also bounded by the hard cap on the crop box itself.
+    max_px = rebar_service.CROP_MAX_BOX_PT * rebar_service.RENDER_DPI / 72.0 + 1
+    assert crop.width <= max_px
+    assert crop.height <= max_px
     # Height covers tokens (~35pt tall) + margins ~= 115pt << width; a fixed
     # 200pt-radius crop would be near-square, a tight one is clearly wide.
     assert crop.width / crop.height > 1.6
+
+
+def test_render_evidence_unknown_item_returns_none():
+    analysis = rebar_service.Analysis(_make_pdf(shift=False))
+    assert analysis.render_evidence(999) is None

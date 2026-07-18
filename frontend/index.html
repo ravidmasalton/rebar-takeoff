@@ -182,6 +182,20 @@
       );
     }
 
+    // Per-row evidence thumbnail. The crop is rendered server-side on demand:
+    // loading="lazy" defers the fetch until the row scrolls near the viewport,
+    // so opening a result with dozens of rows costs zero image requests up
+    // front. Items with no renderable crop 404 → show a dash.
+    function Thumb({ item, onZoom }) {
+      const [failed, setFailed] = useState(false);
+      if (failed || !item.evidence_url) return <span className="thumb-empty">—</span>;
+      return (
+        <img className="thumb" src={item.evidence_url} loading="lazy"
+             alt={"קריאה " + item.id} onClick={() => onZoom(item)}
+             onError={() => setFailed(true)} title="לחצו להגדלה ואימות" />
+      );
+    }
+
     function Row({ item, onChange, onZoom }) {
       const flagged = item.flags && item.flags.length > 0;
       const excluded = (Number(item.count) || 0) <= 0;
@@ -201,12 +215,7 @@
       return (
         <tr className={(flagged ? "flagged " : "") + (excluded ? "excluded" : "")}>
           <td>{item.id}</td>
-          <td>
-            {item.evidence_png
-              ? <img className="thumb" src={item.evidence_png} alt={"קריאה " + item.id}
-                     onClick={() => onZoom(item)} title="לחצו להגדלה ואימות" />
-              : <span className="thumb-empty">—</span>}
-          </td>
+          <td><Thumb item={item} onZoom={onZoom} /></td>
           <td>Ø{item.diameter}</td>
           <td>{item.spacing ? "@" + item.spacing : "—"}</td>
           <td>{item.length_cm ?? "—"}</td>
@@ -242,7 +251,7 @@
                   : ""}</strong>
               <button onClick={onClose}>סגירה ✕</button>
             </div>
-            <img src={item.evidence_png} alt={"קריאה " + item.id} />
+            <img src={item.evidence_url} alt={"קריאה " + item.id} />
             <div className="legend">
               <span><span className="dot" style={{ background: "#dc1e1e" }}></span>קריאה</span>
               <span><span className="dot" style={{ background: "#005ae6" }}></span>מספר רוחב אזור</span>
@@ -259,7 +268,12 @@
       const [busy, setBusy] = useState(false);
       const [zoom, setZoom] = useState(null);   // item whose crop is shown enlarged
 
-      const onResult = (data) => setItems(data.items.map((it) => ({ ...it })));
+      // Crops are not inlined in the response; each row gets a URL that the
+      // server renders on demand (keyed to this analysis).
+      const onResult = (data) => setItems(data.items.map((it) => ({
+        ...it,
+        evidence_url: `/evidence/${it.id}?analysis_id=${encodeURIComponent(data.analysis_id || "")}`,
+      })));
       const updateRow = (updated) =>
         setItems((prev) => prev.map((it) => (it.id === updated.id ? updated : it)));
 

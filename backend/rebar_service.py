@@ -1,10 +1,14 @@
 """
 Rebar quantity takeoff from vector structural-drawing PDFs.
 
-All processing is in-memory and stateless. The single public entry point is
-`analyze_pdf(pdf_bytes)`, which returns a JSON-serialisable dict with two
-sections: `items` (one row per rebar callout) and `summary` (aggregates and
-flags for manual verification).
+All processing is in-memory and stateless. `Analysis(pdf_bytes)` parses the
+PDF once; `.response()` returns a JSON-serialisable dict with two sections:
+`items` (one row per rebar callout) and `summary` (aggregates and flags for
+manual verification), and `.render_evidence(item_id)` rasterises the evidence
+crop for a single item on demand (crops are never bulk-rendered — a large
+drawing can have dozens of callouts and holding every PNG at once exhausts
+memory on small servers). `analyze_pdf(pdf_bytes)` remains as a convenience
+wrapper returning just the response dict.
 
 Domain notes
 ------------
@@ -19,7 +23,6 @@ Domain notes
 
 from __future__ import annotations
 
-import base64
 import io
 import logging
 import math
@@ -67,12 +70,18 @@ MARK_CIRCLE_MAX_SIDE = 42.0
 
 # --- Evidence-crop rendering -----------------------------------------------
 
-# DPI at which the evidence crop is rasterised. High so the numbers read like
-# a zoomed screenshot; only the crop region is rendered, never the full page.
-RENDER_DPI = 300
+# DPI at which the evidence crop is rasterised. High enough that the numbers
+# read like a zoomed screenshot; only the crop region is rendered, never the
+# full page.
+RENDER_DPI = 200
 
 # Margin (points) added around the tight bounding box of the evidence tokens.
 CROP_MARGIN_PT = 40.0
+
+# Hard cap (points) on either side of the crop box, centred on the callout. A
+# mispaired far-away width token would otherwise blow the region — and the
+# rendered bitmap — up to a large slice of the page.
+CROP_MAX_BOX_PT = 700.0
 
 # Longest side (px) the stored crop is downscaled to, to keep the JSON light.
 CROP_MAX_PX = 1600
@@ -166,7 +175,6 @@ class Item:
     counted: bool = True              # included in the summary totals?
     position: dict = field(default_factory=dict)
     flags: list = field(default_factory=list)
-    evidence_png: Optional[str] = None  # data-URI PNG crop of the drawing
 
 
 # --- Bidi / normalisation --------------------------------------------------
@@ -626,14 +634,15 @@ def _ink_fraction(image) -> float:
     return non_white / total
 
 
-def _render_evidence_crop(doc, page_bbox: tuple, row: _Row) -> Optional[str]:
+def _render_evidence_crop(doc, page_bbox: tuple, row: _Row) -> Optional[bytes]:
     """
-    Render a tight, zoomed crop of the evidence for one callout.
+    Render a tight, zoomed crop of the evidence for one callout as PNG bytes.
 
     The crop is the bounding box of {callout token, its L= token, the paired
-    width number and its dimension-arrow line} plus CROP_MARGIN_PT, rendered
-    at RENDER_DPI via pdfium's region rendering (the full page is never
-    rasterised). Overlays: red callout, blue width number, orange L=.
+    width number and its dimension-arrow line} plus CROP_MARGIN_PT, capped at
+    CROP_MAX_BOX_PT per side, rendered at RENDER_DPI via pdfium's region
+    rendering (the full page is never rasterised). Overlays: red callout,
+    blue width number, orange L=.
     """
     try:
         from PIL import ImageDraw
@@ -658,6 +667,12 @@ def _render_evidence_crop(doc, page_bbox: tuple, row: _Row) -> Optional[str]:
     ry0 = min(b[1] for b in boxes) - CROP_MARGIN_PT
     rx1 = max(b[2] for b in boxes) + CROP_MARGIN_PT
     ry1 = max(b[3] for b in boxes) + CROP_MARGIN_PT
+
+    # Cap the box size, keeping the callout centred: evidence past the cap is
+    # cut off rather than letting the bitmap grow unbounded.
+    half = CROP_MAX_BOX_PT / 2.0
+    rx0, rx1 = max(rx0, callout.cx - half), min(rx1, callout.cx + half)
+    ry0, ry1 = max(ry0, callout.cy - half), min(ry1, callout.cy + half)
 
     # Clamp to the page. page_bbox is pdfplumber's page.bbox: the page spans
     # [bbox0, bbox2] horizontally and [bbox1, bbox3] in top-down coordinates.
@@ -722,14 +737,56 @@ def _render_evidence_crop(doc, page_bbox: tuple, row: _Row) -> Optional[str]:
 
     buf = io.BytesIO()
     crop.save(buf, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    return buf.getvalue()
 
 
 # --- Public API ------------------------------------------------------------
 
 
+class Analysis:
+    """
+    Parsed takeoff for one uploaded PDF.
+
+    Keeps the parsed rows plus the original bytes (both small) so a single
+    evidence crop can be rasterised on demand; no rendered image is ever held
+    beyond the one being produced.
+    """
+
+    def __init__(self, pdf_bytes: bytes):
+        self._pdf_bytes = pdf_bytes
+        self._rows, self._page_bboxes = _parse_rows(pdf_bytes)
+
+    def response(self) -> dict:
+        """The JSON-serialisable takeoff (items + summary), without images."""
+        return _build_response(_rows_to_items(self._rows))
+
+    def render_evidence(self, item_id: int) -> Optional[bytes]:
+        """PNG bytes of the evidence crop for one item, or None."""
+        row = next((r for r in self._rows if r.id == item_id), None)
+        if row is None:
+            return None
+        bbox = self._page_bboxes.get(row.callout.tok.page)
+        if bbox is None:
+            return None
+        doc = _open_renderer(self._pdf_bytes)
+        if doc is None:
+            return None
+        try:
+            return _render_evidence_crop(doc, bbox, row)
+        except Exception:
+            logger.exception("evidence crop #%d failed", row.id)
+            return None
+        finally:
+            doc.close()
+
+
 def analyze_pdf(pdf_bytes: bytes) -> dict:
     """Run the full takeoff on a PDF and return the response dict."""
+    return Analysis(pdf_bytes).response()
+
+
+def _parse_rows(pdf_bytes: bytes) -> tuple[list[_Row], dict[int, tuple]]:
+    """Parse the PDF into resolved rows plus pdfplumber page.bbox per page."""
     rows: list[_Row] = []
     page_bboxes: dict[int, tuple] = {}  # pdfplumber page.bbox per page number
     next_id = 1
@@ -800,14 +857,7 @@ def analyze_pdf(pdf_bytes: bytes) -> dict:
         # Pass 2: resolve distributed callouts that had no measured width.
         _estimate_missing_widths(rows)
 
-    # Pass 3: render evidence crops (pdfium; optional dependency).
-    doc = _open_renderer(pdf_bytes)
-    try:
-        items = _rows_to_items(rows, doc, page_bboxes)
-    finally:
-        if doc is not None:
-            doc.close()
-    return _build_response(items)
+    return rows, page_bboxes
 
 
 def _find_arrow_segment(width_tok: Token, segments: list[Segment]) -> Optional[Segment]:
@@ -824,28 +874,19 @@ def _find_arrow_segment(width_tok: Token, segments: list[Segment]) -> Optional[S
     return best
 
 
-def _rows_to_items(rows: list[_Row], doc, page_bboxes: dict[int, tuple]) -> list[Item]:
+def _rows_to_items(rows: list[_Row]) -> list[Item]:
     items: list[Item] = []
     for r in rows:
         count = r.count or 0
+        flags = list(r.flags)
         if r.length_cm is None:
-            r.flags.append("missing_length")
+            flags.append("missing_length")
         if r.shape == "needs review":
-            r.flags.append("unresolved_shape")
+            flags.append("unresolved_shape")
 
         kg_per_m = STEEL_KG_PER_M_COEFF * (r.callout.diameter ** 2)
         total_m = (count * r.length_cm / 100.0) if r.length_cm else 0.0
         weight_kg = total_m * kg_per_m
-
-        evidence = None
-        if doc is not None:
-            bbox = page_bboxes.get(r.callout.tok.page)
-            if bbox is not None:
-                try:
-                    evidence = _render_evidence_crop(doc, bbox, r)
-                except Exception:
-                    logger.exception("evidence crop #%d failed", r.id)
-                    evidence = None  # never let a bad crop break the takeoff
 
         items.append(
             Item(
@@ -866,8 +907,7 @@ def _rows_to_items(rows: list[_Row], doc, page_bboxes: dict[int, tuple]) -> list
                     "x": round(r.callout.tok.cx, 1),
                     "y": round(r.callout.tok.cy, 1),
                 },
-                flags=r.flags,
-                evidence_png=evidence,
+                flags=flags,
             )
         )
     return items

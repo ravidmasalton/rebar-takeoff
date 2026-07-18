@@ -1,8 +1,9 @@
 # Rebar Quantity Takeoff
 
 Extracts rebar (steel reinforcement) quantities from **vector** structural-drawing
-PDFs. FastAPI backend + single-page React frontend. Fully **stateless** — the PDF
-is processed in memory and discarded; nothing is stored.
+PDFs. FastAPI backend + single-page React frontend. Everything is processed in
+memory; nothing is written to disk or a database. The most recent analysis is
+kept in a single in-memory slot so evidence crops can be rendered on demand.
 
 ## Run
 
@@ -47,8 +48,13 @@ never guessed.
 
 **Evidence crop**: each callout gets a tight, zoomed PNG crop — the bounding box
 of {callout token, `L=` token, paired width number + its dimension-arrow line}
-plus 40 pt margin, rendered at 300 DPI via pdfium *region* rendering (the full
-page is never rasterised) — returned as a base64 data-URI in `item.evidence_png`.
+plus 40 pt margin, capped at 700 pt per side, rendered at 200 DPI via pdfium
+*region* rendering (the full page is never rasterised). Crops are **not**
+inlined in the `/analyze` response — a large drawing can have dozens of
+callouts, and bulk-rendering every crop exhausts memory on small servers.
+Instead `GET /evidence/{item_id}?analysis_id=…` renders a single crop on
+demand from the cached analysis (one in-memory slot holding the parsed rows +
+PDF bytes; a new upload replaces it, and a stale `analysis_id` gets a 404).
 Overlays: callout (red), width number (blue), `L=` (orange), so
 `count = ceil(width/spacing)+1` can be checked against the exact numbers it came
 from. Coordinates are mapped through pdfplumber's `page.bbox` — **never** assuming
@@ -56,16 +62,20 @@ a (0,0) origin — because real drawings ship shifted mediaboxes (e.g.
 `(-2203.08, 1449.18, …)`); pdfplumber reports raw PDF x but a `top` that ignores
 the mediabox y-offset, so `px=(x−bbox[0])·dpi/72`, `py=(top−bbox[1])·dpi/72`.
 Rendered crops are validated for non-blankness (>1 % ink) before overlays; blank
-crops are logged with the computed pixel box + mediabox and returned as `null`.
-Rendering is optional — if `pypdfium2` is missing the takeoff still runs with
-`evidence_png = null`. Regression tests: [backend/test_rebar_service.py](backend/test_rebar_service.py).
+crops are logged with the computed pixel box + mediabox and 404 instead of
+returning white. Rendering is optional — if `pypdfium2` is missing the takeoff
+still runs and `/evidence` returns 404.
+Regression tests: [backend/test_rebar_service.py](backend/test_rebar_service.py).
 
-**Response**: `items` (one row per callout) + `summary` (per-diameter totals,
-grand total, source counts, `excluded_count`, flagged items for manual verification).
+**Response**: `analysis_id` (key for `/evidence` requests) + `items` (one row
+per callout) + `summary` (per-diameter totals, grand total, source counts,
+`excluded_count`, flagged items for manual verification).
 
 ## Frontend
 
 Hebrew RTL SPA ([frontend/index.html](frontend/index.html), React via CDN).
 Drag & drop upload, editable table (width/count) with live recalculation, a
 per-row evidence thumbnail that opens a full-size verification modal, and a summary
-panel with flagged items. No persistence — refresh clears everything.
+panel with flagged items. Thumbnails load lazily (`loading="lazy"`) — the
+browser fetches each crop only as its row scrolls into view. No persistence —
+refresh clears everything.
