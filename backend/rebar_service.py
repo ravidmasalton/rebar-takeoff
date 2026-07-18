@@ -2,13 +2,24 @@
 Rebar quantity takeoff from vector structural-drawing PDFs.
 
 All processing is in-memory and stateless. `Analysis(pdf_bytes)` parses the
-PDF once; `.response()` returns a JSON-serialisable dict with two sections:
-`items` (one row per rebar callout) and `summary` (aggregates and flags for
-manual verification), and `.render_evidence(item_id)` rasterises the evidence
-crop for a single item on demand (crops are never bulk-rendered — a large
-drawing can have dozens of callouts and holding every PNG at once exhausts
-memory on small servers). `analyze_pdf(pdf_bytes)` remains as a convenience
-wrapper returning just the response dict.
+PDF once (an optional `progress` callback receives `(phase, percent)` so the
+caller can stream progress to a client); `.response()` returns a
+JSON-serialisable dict with two sections: `items` (one row per rebar callout)
+and `summary` (aggregates and flags for manual verification).
+
+Two expensive steps are deliberately *not* part of parsing, because profiling
+showed they dominate wall time while contributing nothing to counts/weights:
+
+* `.shapes()` — bar-shape classification (~60% of a naive analyze: O(n²)
+  connected-components over the vector linework near every callout). Computed
+  once on first call and cached.
+* `.render_evidence(item_id)` — rasterises the evidence crop for a single
+  item on demand (crops are never bulk-rendered — a large drawing can have
+  dozens of callouts and holding every PNG at once exhausts memory on small
+  servers).
+
+`analyze_pdf(pdf_bytes)` remains as a convenience wrapper returning just the
+response dict.
 
 Domain notes
 ------------
@@ -30,7 +41,7 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from statistics import median
-from typing import Optional
+from typing import Callable, Optional
 
 import pdfplumber
 
@@ -167,7 +178,8 @@ class Item:
     length_cm: Optional[float]
     zone_width_cm: Optional[float]
     count: int
-    shape: str
+    # Filled by the separate /shapes pass, not by /analyze (see module doc).
+    shape: Optional[str] = None
     shape_segments_pts: list = field(default_factory=list)
     total_m: float = 0.0
     weight_kg: float = 0.0
@@ -545,13 +557,9 @@ class _Row:
     length_cm: Optional[float]
     length_tok: Optional[Token]
     width_tok: Optional[Token]
-    arrow_seg: Optional[Segment]   # dimension-arrow line under the width number
     zone_width_cm: Optional[float]
     count: Optional[int]           # None until the estimation pass resolves it
     source: str
-    shape: str
-    seg_pts: list
-    chain: Optional[list]
     flags: list
 
 
@@ -634,7 +642,9 @@ def _ink_fraction(image) -> float:
     return non_white / total
 
 
-def _render_evidence_crop(doc, page_bbox: tuple, row: _Row) -> Optional[bytes]:
+def _render_evidence_crop(
+    doc, page_bbox: tuple, row: _Row, arrow_seg: Optional[Segment]
+) -> Optional[bytes]:
     """
     Render a tight, zoomed crop of the evidence for one callout as PNG bytes.
 
@@ -658,8 +668,8 @@ def _render_evidence_crop(doc, page_bbox: tuple, row: _Row) -> Optional[bytes]:
     for tok in (row.length_tok, row.width_tok):
         if tok is not None:
             boxes.append((tok.x0, tok.top, tok.x1, tok.bottom))
-    if row.arrow_seg is not None:
-        s = row.arrow_seg
+    if arrow_seg is not None:
+        s = arrow_seg
         boxes.append((min(s.x0, s.x1), min(s.y0, s.y1),
                       max(s.x0, s.x1), max(s.y0, s.y1)))
 
@@ -743,22 +753,49 @@ def _render_evidence_crop(doc, page_bbox: tuple, row: _Row) -> Optional[bytes]:
 # --- Public API ------------------------------------------------------------
 
 
+# Progress callback: receives (phase, percent). Phases: extract / detect /
+# compute. Percent is monotonic across the whole parse.
+ProgressFn = Callable[[str, float], None]
+
+
 class Analysis:
     """
     Parsed takeoff for one uploaded PDF.
 
-    Keeps the parsed rows plus the original bytes (both small) so a single
-    evidence crop can be rasterised on demand; no rendered image is ever held
-    beyond the one being produced.
+    Keeps the parsed rows, the per-page vector segments and the original
+    bytes so shapes and evidence crops can be produced on demand; no rendered
+    image is ever held beyond the one being produced. The pdfium document is
+    opened lazily on the first crop and reused (pypdfium2 closes it when the
+    Analysis is garbage-collected).
     """
 
-    def __init__(self, pdf_bytes: bytes):
+    def __init__(self, pdf_bytes: bytes, progress: Optional[ProgressFn] = None):
         self._pdf_bytes = pdf_bytes
-        self._rows, self._page_bboxes = _parse_rows(pdf_bytes)
+        self._rows, self._page_bboxes, self._segments_by_page = _parse_rows(
+            pdf_bytes, progress
+        )
+        self._doc = None                                  # lazy pdfium handle
+        self._shapes: Optional[dict[int, dict]] = None    # lazy shape cache
 
     def response(self) -> dict:
-        """The JSON-serialisable takeoff (items + summary), without images."""
+        """The JSON takeoff (items + summary) — no images, no shapes."""
         return _build_response(_rows_to_items(self._rows))
+
+    def shapes(self) -> dict[int, dict]:
+        """
+        Classify the bar shape for every item; computed once and cached.
+
+        This is the O(n²)-per-callout pass over the vector linework that
+        dominates a naive analyze, which is why it is not part of parsing.
+        """
+        if self._shapes is None:
+            shapes: dict[int, dict] = {}
+            for r in self._rows:
+                segs = self._segments_by_page.get(r.callout.tok.page, [])
+                shape, seg_pts, _chain = _detect_shape(r.callout.tok, segs)
+                shapes[r.id] = {"shape": shape, "segments_pts": seg_pts}
+            self._shapes = shapes
+        return self._shapes
 
     def render_evidence(self, item_id: int) -> Optional[bytes]:
         """PNG bytes of the evidence crop for one item, or None."""
@@ -768,16 +805,20 @@ class Analysis:
         bbox = self._page_bboxes.get(row.callout.tok.page)
         if bbox is None:
             return None
-        doc = _open_renderer(self._pdf_bytes)
-        if doc is None:
+        if self._doc is None:
+            self._doc = _open_renderer(self._pdf_bytes)
+        if self._doc is None:
             return None
+        arrow_seg = None
+        if row.width_tok is not None:
+            arrow_seg = _find_arrow_segment(
+                row.width_tok, self._segments_by_page.get(row.callout.tok.page, [])
+            )
         try:
-            return _render_evidence_crop(doc, bbox, row)
+            return _render_evidence_crop(self._doc, bbox, row, arrow_seg)
         except Exception:
             logger.exception("evidence crop #%d failed", row.id)
             return None
-        finally:
-            doc.close()
 
 
 def analyze_pdf(pdf_bytes: bytes) -> dict:
@@ -785,19 +826,37 @@ def analyze_pdf(pdf_bytes: bytes) -> dict:
     return Analysis(pdf_bytes).response()
 
 
-def _parse_rows(pdf_bytes: bytes) -> tuple[list[_Row], dict[int, tuple]]:
-    """Parse the PDF into resolved rows plus pdfplumber page.bbox per page."""
+def _parse_rows(
+    pdf_bytes: bytes, progress: Optional[ProgressFn] = None
+) -> tuple[list[_Row], dict[int, tuple], dict[int, list[Segment]]]:
+    """
+    Parse the PDF into resolved rows, plus per-page page.bbox and segments.
+
+    Segments are returned (not just used) so the lazy shape / evidence passes
+    can run later without re-opening the PDF with pdfplumber.
+    """
     rows: list[_Row] = []
     page_bboxes: dict[int, tuple] = {}  # pdfplumber page.bbox per page number
+    segments_by_page: dict[int, list[Segment]] = {}
     next_id = 1
 
+    def report(phase: str, percent: float) -> None:
+        if progress is not None:
+            progress(phase, round(min(percent, 99.0), 1))
+
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        n_pages = max(1, len(pdf.pages))
+        page_share = 93.0 / n_pages  # 2% open + 93% pages + 5% final compute
         for page_index, page in enumerate(pdf.pages, start=1):
+            page_base = 2.0 + (page_index - 1) * page_share
+            report("extract", page_base)
             page_bboxes[page_index] = tuple(float(v) for v in page.bbox)
             tokens = _extract_tokens(page, page_index)
             segments = _extract_segments(page, page_index)
+            segments_by_page[page_index] = segments
             circle_boxes = _circle_boxes(page)
 
+            report("detect", page_base + page_share * 0.7)
             callouts = _parse_callouts(tokens)
 
             # Standalone width-candidate numbers: pure numbers that are not
@@ -811,10 +870,8 @@ def _parse_rows(pdf_bytes: bytes) -> tuple[list[_Row], dict[int, tuple]]:
 
             for callout in callouts:
                 length_cm, length_tok = _find_length(callout, tokens)
-                shape, seg_pts, chain = _detect_shape(callout.tok, segments)
                 flags: list[str] = []
                 width_tok: Optional[Token] = None
-                arrow_seg: Optional[Segment] = None
                 zone_width: Optional[float] = None
 
                 if callout.n is not None:
@@ -828,7 +885,6 @@ def _parse_rows(pdf_bytes: bytes) -> tuple[list[_Row], dict[int, tuple]]:
                         zone_width, idx = match
                         used_widths.add(idx)
                         width_tok = number_tokens[idx]
-                        arrow_seg = _find_arrow_segment(width_tok, segments)
                         count = math.ceil(zone_width / callout.spacing) + 1
                         source = "measured_width"
                     else:
@@ -846,18 +902,18 @@ def _parse_rows(pdf_bytes: bytes) -> tuple[list[_Row], dict[int, tuple]]:
                     _Row(
                         id=next_id, callout=callout,
                         length_cm=length_cm, length_tok=length_tok,
-                        width_tok=width_tok, arrow_seg=arrow_seg,
+                        width_tok=width_tok,
                         zone_width_cm=zone_width,
-                        count=count, source=source, shape=shape,
-                        seg_pts=seg_pts, chain=chain, flags=flags,
+                        count=count, source=source, flags=flags,
                     )
                 )
                 next_id += 1
 
         # Pass 2: resolve distributed callouts that had no measured width.
+        report("compute", 95.0)
         _estimate_missing_widths(rows)
 
-    return rows, page_bboxes
+    return rows, page_bboxes, segments_by_page
 
 
 def _find_arrow_segment(width_tok: Token, segments: list[Segment]) -> Optional[Segment]:
@@ -881,8 +937,6 @@ def _rows_to_items(rows: list[_Row]) -> list[Item]:
         flags = list(r.flags)
         if r.length_cm is None:
             flags.append("missing_length")
-        if r.shape == "needs review":
-            flags.append("unresolved_shape")
 
         kg_per_m = STEEL_KG_PER_M_COEFF * (r.callout.diameter ** 2)
         total_m = (count * r.length_cm / 100.0) if r.length_cm else 0.0
@@ -896,8 +950,6 @@ def _rows_to_items(rows: list[_Row]) -> list[Item]:
                 length_cm=r.length_cm,
                 zone_width_cm=r.zone_width_cm,
                 count=count,
-                shape=r.shape,
-                shape_segments_pts=r.seg_pts,
                 total_m=round(total_m, 3),
                 weight_kg=round(weight_kg, 3),
                 source=r.source,

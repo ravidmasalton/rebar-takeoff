@@ -57,6 +57,11 @@
     .spinner { display: inline-block; width: 18px; height: 18px; border: 2px solid #c7d2fe;
                border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; }
     @keyframes spin { to { transform: rotate(360deg); } }
+    .bar { height: 8px; background: var(--line); border-radius: 999px; overflow: hidden;
+           max-width: 420px; margin: 14px auto 0; }
+    .bar-fill { height: 100%; background: var(--accent); border-radius: 999px;
+                transition: width .35s ease; }
+    .bar-label { margin-top: 8px; font-size: 13px; color: var(--muted); }
     button.reset { background: none; border: 1px solid var(--line); border-radius: 8px;
                    padding: 6px 14px; cursor: pointer; font-family: inherit; font-size: 13px; }
     tr.excluded td { opacity: .6; }
@@ -78,7 +83,16 @@
   <div id="root"></div>
 
   <script type="text/babel">
-    const { useState, useCallback, useMemo } = React;
+    const { useState, useCallback, useMemo, useRef } = React;
+
+    // Server progress phases → Hebrew labels for the upload progress bar.
+    const PHASE_LABELS = {
+      pending: "מתחיל…",
+      extract: "חילוץ טקסט",
+      detect: "זיהוי סימונים",
+      compute: "חישוב",
+      done: "חישוב",
+    };
 
     // Weight per metre for a round bar; d in mm. Mirrors the backend formula so
     // edits recalculate live without a round-trip.
@@ -93,17 +107,30 @@
 
     function Uploader({ onResult, onError, busy, setBusy }) {
       const [over, setOver] = useState(false);
+      const [prog, setProg] = useState(null);   // {phase, percent} while analysing
+      const pollRef = useRef(null);
 
       const send = useCallback(async (file) => {
         if (!file) return;
         if (!file.name.toLowerCase().endsWith(".pdf")) {
           onError("יש להעלות קובץ PDF בלבד."); return;
         }
-        setBusy(true); onError(null);
+        setBusy(true); onError(null); setProg({ phase: "pending", percent: 0 });
+
+        // Poll the server-side progress of this job while /analyze is in flight.
+        const jobId = (crypto.randomUUID && crypto.randomUUID()) ||
+                      Date.now() + "-" + Math.random().toString(16).slice(2);
+        pollRef.current = setInterval(async () => {
+          try {
+            const r = await fetch(`/progress/${jobId}`);
+            if (r.ok) setProg(await r.json());
+          } catch (_) { /* progress is best-effort */ }
+        }, 400);
+
         try {
           const fd = new FormData();
           fd.append("file", file);
-          const res = await fetch("/analyze", { method: "POST", body: fd });
+          const res = await fetch(`/analyze?job_id=${jobId}`, { method: "POST", body: fd });
           if (!res.ok) {
             const j = await res.json().catch(() => ({}));
             throw new Error(j.detail || `שגיאת שרת (${res.status})`);
@@ -112,10 +139,12 @@
         } catch (e) {
           onError(e.message || "העלאה נכשלה.");
         } finally {
-          setBusy(false);
+          clearInterval(pollRef.current);
+          setBusy(false); setProg(null);
         }
       }, [onResult, onError, setBusy]);
 
+      const pct = Math.max(0, Math.min(100, Math.round((prog && prog.percent) || 0)));
       return (
         <div
           className={"drop" + (over ? " over" : "")}
@@ -125,7 +154,13 @@
           onClick={() => document.getElementById("file-input").click()}
         >
           {busy
-            ? <span><span className="spinner"></span> &nbsp;מנתח את הקובץ…</span>
+            ? <div>
+                <span><span className="spinner"></span> &nbsp;מנתח את הקובץ…</span>
+                <div className="bar"><div className="bar-fill" style={{ width: pct + "%" }}></div></div>
+                <div className="bar-label">
+                  {PHASE_LABELS[prog && prog.phase] || "מנתח…"} · {pct}%
+                </div>
+              </div>
             : <span><strong>גררו לכאן קובץ PDF</strong> או לחצו לבחירה</span>}
           <input id="file-input" type="file" accept="application/pdf" style={{ display: "none" }}
                  onChange={(e) => send(e.target.files[0])} />
@@ -227,7 +262,7 @@
             <input className="cell" type="number" value={item.count}
                    onChange={(e) => editCount(e.target.value)} />
           </td>
-          <td>{item.shape}</td>
+          <td>{item.shape ?? "…"}</td>
           <td>{item.total_m.toFixed(2)}</td>
           <td><strong>{item.weight_kg.toFixed(2)}</strong></td>
           <td><span className={"tag " + item.source}>{
@@ -269,11 +304,34 @@
       const [zoom, setZoom] = useState(null);   // item whose crop is shown enlarged
 
       // Crops are not inlined in the response; each row gets a URL that the
-      // server renders on demand (keyed to this analysis).
-      const onResult = (data) => setItems(data.items.map((it) => ({
-        ...it,
-        evidence_url: `/evidence/${it.id}?analysis_id=${encodeURIComponent(data.analysis_id || "")}`,
-      })));
+      // server renders on demand (keyed to this analysis). Shapes are the
+      // expensive pass, computed server-side after the table is already
+      // shown — fetched here in the background and merged in.
+      const onResult = (data) => {
+        const aid = data.analysis_id || "";
+        setItems(data.items.map((it) => ({
+          ...it,
+          analysis_id: aid,
+          evidence_url: `/evidence/${it.id}?analysis_id=${encodeURIComponent(aid)}`,
+        })));
+        fetch(`/shapes?analysis_id=${encodeURIComponent(aid)}`)
+          .then((r) => (r.ok ? r.json() : null))
+          .then((j) => {
+            if (!j || !j.shapes) return;
+            setItems((prev) => {
+              // Ignore a late response for a superseded upload.
+              if (!prev || !prev.length || prev[0].analysis_id !== aid) return prev;
+              return prev.map((it) => {
+                const s = j.shapes[it.id];
+                if (!s) return it;
+                const flags = s.shape === "needs review" && !(it.flags || []).includes("unresolved_shape")
+                  ? [...(it.flags || []), "unresolved_shape"] : it.flags;
+                return { ...it, shape: s.shape, shape_segments_pts: s.segments_pts, flags };
+              });
+            });
+          })
+          .catch(() => { /* shape column stays "…" */ });
+      };
       const updateRow = (updated) =>
         setItems((prev) => prev.map((it) => (it.id === updated.id ? updated : it)));
 

@@ -35,8 +35,14 @@ curl.exe -s "http://127.0.0.1:8123/evidence/1?analysis_id=<id>" -o crop.png
   the callout, blue on the width number, orange on `L=`.
 - Stale/foreign `analysis_id` → 404; a new upload replaces the single cache
   slot (old id must 404 afterwards).
+- `item.shape` is `null` in `/analyze`; `GET /shapes?analysis_id=<id>` computes
+  shapes lazily (cached — second call must be near-instant).
+- Progress: POST `/analyze?job_id=<uuid>` and poll `GET /progress/<job_id>`
+  concurrently (needs threads — see `scratchpad drive_server.py` pattern);
+  phases extract/detect/compute, monotonic percent, `done` at 100. Unknown
+  job → `{"phase": "pending"}`, not 404.
 - Frontend at `/` — thumbnails are `<img loading="lazy">` pointing at
-  `/evidence/{id}?analysis_id=…`.
+  `/evidence/{id}?analysis_id=…`; progress bar polls `/progress/{job_id}`.
 
 ## Gotchas
 

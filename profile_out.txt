@@ -1,0 +1,12 @@
+total 0.208
+_detect_shape 0.402
+_extract_tokens 0.388
+_find_length 0.006
+_extract_segments 0.003
+_find_zone_width 0.002
+_build_response 0.001
+pdfplumber.open 0.001
+_estimate_missing_widths 0.000
+_parse_callouts 0.000
+_rows_to_items 0.000
+_circle_boxes 0.000

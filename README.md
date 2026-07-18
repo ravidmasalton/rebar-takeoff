@@ -44,7 +44,19 @@ aggregated per diameter + grand total.
 
 **Shape**: bold vector polyline nearest the callout is chained and classified
 `straight / L / U / Z` (U vs Z by bend direction). Ambiguous → `needs review`,
-never guessed.
+never guessed. Profiling showed this pass (O(n²) connected-components over the
+linework near every callout) dominates a naive analyze (~60% of wall time)
+while contributing nothing to counts/weights, so it is **not** part of
+`/analyze`: `GET /shapes?analysis_id=…` computes it lazily from the cached
+parse (once, then cached) and the frontend merges it into the table after the
+results are already on screen. `item.shape` is `null` in the `/analyze`
+response.
+
+**Progress**: `/analyze` accepts an optional client-generated `job_id` query
+param; `GET /progress/{job_id}` returns `{phase, percent}` (`extract` /
+`detect` / `compute`, monotonic percent) while the analysis runs. The heavy
+endpoints (`/analyze`, `/shapes`) are sync `def` so FastAPI runs them in its
+threadpool and the event loop stays free to answer progress polls.
 
 **Evidence crop**: each callout gets a tight, zoomed PNG crop — the bounding box
 of {callout token, `L=` token, paired width number + its dimension-arrow line}
@@ -67,15 +79,18 @@ returning white. Rendering is optional — if `pypdfium2` is missing the takeoff
 still runs and `/evidence` returns 404.
 Regression tests: [backend/test_rebar_service.py](backend/test_rebar_service.py).
 
-**Response**: `analysis_id` (key for `/evidence` requests) + `items` (one row
-per callout) + `summary` (per-diameter totals, grand total, source counts,
-`excluded_count`, flagged items for manual verification).
+**Response**: `analysis_id` (key for `/evidence` and `/shapes` requests) +
+`items` (one row per callout; `shape` is `null` until `/shapes`) + `summary`
+(per-diameter totals, grand total, source counts, `excluded_count`, flagged
+items for manual verification).
 
 ## Frontend
 
 Hebrew RTL SPA ([frontend/index.html](frontend/index.html), React via CDN).
-Drag & drop upload, editable table (width/count) with live recalculation, a
-per-row evidence thumbnail that opens a full-size verification modal, and a summary
-panel with flagged items. Thumbnails load lazily (`loading="lazy"`) — the
-browser fetches each crop only as its row scrolls into view. No persistence —
-refresh clears everything.
+Drag & drop upload with a live progress bar (polls `/progress/{job_id}` every
+400 ms; phase labels חילוץ טקסט / זיהוי סימונים / חישוב), editable table
+(width/count) with live recalculation, a per-row evidence thumbnail that opens
+a full-size verification modal, and a summary panel with flagged items. The
+shape column shows `…` until the background `/shapes` fetch merges in.
+Thumbnails load lazily (`loading="lazy"`) — the browser fetches each crop only
+as its row scrolls into view. No persistence — refresh clears everything.

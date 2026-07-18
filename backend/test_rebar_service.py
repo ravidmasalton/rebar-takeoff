@@ -153,3 +153,25 @@ def test_crop_is_tight_not_full_page():
 def test_render_evidence_unknown_item_returns_none():
     analysis = rebar_service.Analysis(_make_pdf(shift=False))
     assert analysis.render_evidence(999) is None
+
+
+def test_shapes_are_lazy_and_classified():
+    """Shape classification is not part of /analyze; shapes() provides it."""
+    analysis = rebar_service.Analysis(_make_pdf(shift=False))
+    item = analysis.response()["items"][0]
+    assert item["shape"] is None  # analyze returns no shapes
+
+    shapes = analysis.shapes()
+    assert shapes[item["id"]]["shape"] == "straight"
+    assert shapes[item["id"]]["segments_pts"]
+    assert analysis.shapes() is shapes  # cached, computed once
+
+
+def test_progress_callback_phases():
+    events = []
+    rebar_service.Analysis(_make_pdf(shift=False), progress=lambda p, pct: events.append((p, pct)))
+    phases = [p for p, _ in events]
+    percents = [pct for _, pct in events]
+    assert "extract" in phases and "detect" in phases and "compute" in phases
+    assert percents == sorted(percents)  # monotonic
+    assert all(0 <= pct <= 99 for pct in percents)
